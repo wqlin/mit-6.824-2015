@@ -1,6 +1,8 @@
 package kvpaxos
 
-import "net"
+import (
+	"net"
+)
 import "fmt"
 import "net/rpc"
 import "log"
@@ -10,23 +12,26 @@ import "sync/atomic"
 import "os"
 import "syscall"
 import "encoding/gob"
-import "math/rand"
+import (
+	"math/rand"
+	"time"
+)
 
+const StartTimeoutInterval = 3 * time.Second // start operation timeout
+const PollInterval = 10 * time.Millisecond
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
+func init() {
+	gob.Register(GetArgs{})
+	gob.Register(PutAppendArgs{})
+	gob.Register(Op{})
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+type notifyArgs struct {
+	ClientId   int64
+	RequestSeq int
+	Value      string
+	Err        Err
 }
 
 type KVPaxos struct {
@@ -37,19 +42,109 @@ type KVPaxos struct {
 	unreliable int32 // for testing
 	px         *paxos.Paxos
 
-	// Your definitions here.
+	requestSeq int32 // index of next entry to start
+	pollSeq    int32 // index of next entry to poll
+	data       map[string]string
+	cache      map[int64]int
+	notifyChs  map[int]chan notifyArgs
+	applyCh    chan Op
 }
 
+func (kv *KVPaxos) nextRequestSeq() int32 {
+	seq := atomic.LoadInt32(&kv.requestSeq)
+	kv.setRequestSeq(seq + 1)
+	return seq
+}
+
+func (kv *KVPaxos) setRequestSeq(i int32) {
+	atomic.StoreInt32(&kv.requestSeq, i)
+}
+
+func (kv *KVPaxos) poll() {
+	seq := atomic.LoadInt32(&kv.pollSeq)
+	for !kv.isdead() {
+		status, arg := kv.px.Status(int(seq))
+		if status == paxos.Pending {
+			kv.setRequestSeq(seq)
+			time.Sleep(PollInterval)
+			continue
+		} else if status == paxos.Decided {
+			kv.applyCh <- arg.(Op)
+		}
+		seq ++
+		atomic.StoreInt32(&kv.pollSeq, seq)
+	}
+}
+
+func (kv *KVPaxos) start(clientId int64, requestSeq int, args interface{}) (string, Err) {
+	seq := int(kv.nextRequestSeq())
+	kv.mu.Lock()
+	kv.px.Start(seq, Op{PaxosSeq: seq, Args: args})
+	notifyCh := make(chan notifyArgs, 1)
+	DPrintf("[Server %d Start %d] ClientId %d", kv.me, seq, clientId)
+	kv.notifyChs[seq] = notifyCh
+	kv.mu.Unlock()
+	select {
+	case notifyResult := <-notifyCh:
+		if notifyResult.ClientId == clientId && notifyResult.RequestSeq == requestSeq {
+			return notifyResult.Value, notifyResult.Err
+		} else {
+			return "", ErrRetry
+		}
+	case <-time.After(StartTimeoutInterval):
+		return "", ErrRetry
+	}
+
+	return "", OK
+}
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	reply.Value, reply.Err = kv.start(args.ClientId, args.RequestSeq, args.copy())
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
-
+	_, reply.Err = kv.start(args.ClientId, args.RequestSeq, args.copy())
 	return nil
+}
+
+func (kv *KVPaxos) apply(op Op) {
+	i := op.PaxosSeq
+	kv.mu.Lock()
+	notifyArg := notifyArgs{-1, -1, "", ErrRetry}
+	if putAppendArg, ok := op.Args.(PutAppendArgs); ok {
+		if kv.cache[putAppendArg.ClientId] < putAppendArg.RequestSeq {
+			if putAppendArg.Op == "Put" {
+				kv.data[putAppendArg.Key] = putAppendArg.Value
+			} else {
+				kv.data[putAppendArg.Key] += putAppendArg.Value
+			}
+			kv.cache[putAppendArg.ClientId] = putAppendArg.RequestSeq
+			DPrintf("[Server %d Key %s execute PutAppend Client %d Seq %d] index %d value %s result %s", kv.me, putAppendArg.Key, putAppendArg.ClientId, putAppendArg.RequestSeq, i, putAppendArg.Value, kv.data[putAppendArg.Key])
+		}
+		notifyArg.ClientId, notifyArg.RequestSeq, notifyArg.Value, notifyArg.Err = putAppendArg.ClientId, putAppendArg.RequestSeq, "", OK
+	} else if getArg, ok := op.Args.(GetArgs); ok {
+		DPrintf("[Server %d Key %s execute Get Client %d Seq %d] index %d value %s", kv.me, getArg.Key, getArg.ClientId, getArg.RequestSeq, i, kv.data[getArg.Key])
+		notifyArg.ClientId, notifyArg.RequestSeq, notifyArg.Value, notifyArg.Err = getArg.ClientId, getArg.RequestSeq, kv.data[getArg.Key], OK
+	}
+	kv.notifyIfPresent(i, notifyArg)
+	kv.mu.Unlock()
+	kv.px.Done(op.PaxosSeq)
+}
+
+func (kv *KVPaxos) notifyIfPresent(seq int, arg notifyArgs) {
+	if ch, ok := kv.notifyChs[seq]; ok {
+		ch <- arg
+		delete(kv.notifyChs, seq)
+	}
+}
+
+func (kv *KVPaxos) run() {
+	go kv.poll()
+	for !kv.isdead() {
+		op := <-kv.applyCh
+		kv.apply(op)
+	}
 }
 
 // tell the server to shut itself down.
@@ -86,18 +181,17 @@ func (kv *KVPaxos) isunreliable() bool {
 // me is the index of the current server in servers[].
 //
 func StartServer(servers []string, me int) *KVPaxos {
-	// call gob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
-
 	kv := new(KVPaxos)
 	kv.me = me
-
-	// Your initialization code here.
+	kv.requestSeq = 0
+	kv.pollSeq = 0
+	kv.data = make(map[string]string)
+	kv.cache = make(map[int64]int)
+	kv.notifyChs = make(map[int]chan notifyArgs)
+	kv.applyCh = make(chan Op, 100)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
-
 	kv.px = paxos.Make(servers, me, rpcs)
 
 	os.Remove(servers[me])
@@ -106,8 +200,6 @@ func StartServer(servers []string, me int) *KVPaxos {
 		log.Fatal("listen error: ", e)
 	}
 	kv.l = l
-
-
 	// please do not change any of the following code,
 	// or do anything to subvert it.
 
@@ -140,5 +232,6 @@ func StartServer(servers []string, me int) *KVPaxos {
 		}
 	}()
 
+	go kv.run()
 	return kv
 }

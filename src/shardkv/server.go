@@ -1,6 +1,8 @@
 package shardkv
 
-import "net"
+import (
+	"net"
+)
 import "fmt"
 import "net/rpc"
 import "log"
@@ -14,21 +16,26 @@ import "encoding/gob"
 import "math/rand"
 import "shardmaster"
 
+const StartTimeoutInterval = 5 * time.Second // start operation timeout
+const PollInterval = 10 * time.Millisecond
+const TickInterval = 250 * time.Millisecond
+const SubmitInterval = 200 * time.Millisecond
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
+func init() {
+	gob.Register(GetArgs{})
+	gob.Register(PutAppendArgs{})
+	gob.Register([]ShardMigrationArgs{})
+	gob.Register(Op{})
+	gob.Register(shardmaster.Config{})
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
-
-type Op struct {
-	// Your definitions here.
+type notifyArgs struct {
+	ClientId   int64
+	RequestSeq int
+	Value      string
+	Err        Err
 }
-
 
 type ShardKV struct {
 	mu         sync.Mutex
@@ -38,21 +45,109 @@ type ShardKV struct {
 	unreliable int32 // for testing
 	sm         *shardmaster.Clerk
 	px         *paxos.Paxos
+	gid        int64              // my replica group ID
+	config     shardmaster.Config // current config
 
-	gid int64 // my replica group ID
+	ownShards       IntSet                             // shards that currently owned by server at current configuration
+	receivingShards map[int]map[int]ShardMigrationArgs // config number -> shard and migration data, receiving from other group
+	waitingShards   IntSet                             // shards -> config number, waiting to migrate from other group
 
-	// Your definitions here.
+	requestSeq int32 // index of next entry to start
+	pollSeq    int32 // index of next entry to poll
+	data       map[string]string
+	cache      map[int64]int
+	notifyChs  map[int]chan notifyArgs
+	applyCh    chan Op
 }
 
+func (kv *ShardKV) configNum() int {
+	kv.mu.Lock()
+	num := kv.config.Num
+	kv.mu.Unlock()
+	return num
+}
+
+func (kv *ShardKV) waitingShardNum() int {
+	kv.mu.Lock()
+	num := len(kv.waitingShards)
+	kv.mu.Unlock()
+	return num
+}
+
+func (kv *ShardKV) getPollSeq() int32 {
+	return atomic.LoadInt32(&kv.pollSeq)
+}
+
+func (kv *ShardKV) nextRequestSeq() int32 {
+	seq := atomic.LoadInt32(&kv.requestSeq)
+	kv.setRequestSeq(seq + 1)
+	return seq
+}
+
+func (kv *ShardKV) setRequestSeq(i int32) {
+	atomic.StoreInt32(&kv.requestSeq, i)
+}
+
+func (kv *ShardKV) poll() {
+	seq := atomic.LoadInt32(&kv.pollSeq)
+	for !kv.isdead() {
+		status, arg := kv.px.Status(int(seq))
+		if status == paxos.Pending {
+			kv.setRequestSeq(seq)
+			time.Sleep(PollInterval)
+			continue
+		} else if status == paxos.Decided {
+			kv.applyCh <- arg.(Op)
+		}
+		seq ++
+		atomic.StoreInt32(&kv.pollSeq, seq)
+	}
+}
+
+func (kv *ShardKV) start(configNum int, clientId int64, requestSeq int, args interface{}) (string, Err) {
+	if kv.isdead() || kv.px.Role() != paxos.Voter || kv.configNum() != configNum {
+		return "", ErrRetry
+	}
+	seq := int(kv.nextRequestSeq())
+	kv.mu.Lock()
+	kv.px.Start(seq, Op{PaxosSeq: seq, Args: args})
+	notifyCh := make(chan notifyArgs, 1)
+	DPrintf("[Start] gid %d server %d seq %d clientId %d args %+v", kv.gid, kv.me, seq, clientId, args)
+	kv.notifyChs[seq] = notifyCh
+	kv.mu.Unlock()
+	select {
+	case notifyResult := <-notifyCh:
+		DPrintf("[Start Return] gid %d server %d seq %d clientId %d reply %+v", kv.gid, kv.me, seq, clientId, notifyResult)
+		if notifyResult.ClientId == clientId && notifyResult.RequestSeq == requestSeq {
+			return notifyResult.Value, notifyResult.Err
+		} else {
+			return "", ErrRetry
+		}
+	case <-time.After(StartTimeoutInterval):
+		return "", ErrRetry
+	}
+	return "", OK
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	reply.Value, reply.Err = kv.start(args.ConfigNum, args.ClientId, args.RequestSeq, args.copy())
 	return nil
 }
 
 // RPC handler for client Put and Append requests
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+	_, reply.Err = kv.start(args.ConfigNum, args.ClientId, args.RequestSeq, args.copy())
+	return nil
+}
+
+func (kv *ShardKV) ShardMigration(args *ShardMigrationArgs, reply *ShardMigrationReply) error {
+	kv.mu.Lock()
+	if _, ok := kv.receivingShards[args.ConfigNum]; !ok {
+		kv.receivingShards[args.ConfigNum] = make(map[int]ShardMigrationArgs)
+	}
+	// DPrintf("[ShardMigration args.ConfigNum %d args.Shard %d] gid %d server %d current config %d", args.ConfigNum, args.Shard, kv.gid, kv.me, kv.config.Num)
+	kv.receivingShards[args.ConfigNum][args.Shard] = args.copy()
+	kv.mu.Unlock()
 	return nil
 }
 
@@ -61,6 +156,173 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
+	for !kv.isdead() {
+		if kv.waitingShardNum() == 0 {
+			currentConfigNum := kv.configNum()
+			nextConfigNum := currentConfigNum + 1
+			newConfig := kv.sm.Query(nextConfigNum) // handle configuration one at a time
+			if newConfig.Num == nextConfigNum {
+				kv.start(currentConfigNum, -2, 1, newConfig)
+			}
+		}
+		time.Sleep(TickInterval)
+	}
+}
+
+func (kv *ShardKV) submit() {
+	for !kv.isdead() {
+		kv.mu.Lock()
+		configNum := kv.config.Num
+		if v, ok := kv.receivingShards[configNum]; ok {
+			var args []ShardMigrationArgs
+			for shard := range kv.waitingShards {
+				if arg, ok := v[shard]; ok {
+					args = append(args, arg.copy())
+				}
+			}
+			kv.mu.Unlock()
+			kv.start(configNum, -1, 1, args)
+			kv.mu.Lock()
+		}
+		kv.mu.Unlock()
+		time.Sleep(SubmitInterval)
+	}
+}
+
+func (kv *ShardKV) apply(op Op) {
+	kv.mu.Lock()
+	i := op.PaxosSeq
+	notifyArg := notifyArgs{Value: "", Err: OK}
+	if arg, ok := op.Args.(PutAppendArgs); ok {
+		shard := key2shard(arg.Key)
+		if arg.ConfigNum != kv.config.Num {
+			notifyArg.Err = ErrWrongGroup
+		} else if _, ok := kv.ownShards[shard]; !ok {
+			notifyArg.Err = ErrWrongGroup
+		} else {
+			if kv.cache[arg.ClientId] < arg.RequestSeq {
+				if arg.Op == "Put" {
+					kv.data[arg.Key] = arg.Value
+					// DPrintf("[Server Put] gid %d server %d config %d client %d seq %d index %d shard %d key %s value %s result %s", kv.gid, kv.me, kv.config.Num, arg.ClientId, arg.RequestSeq, i, shard, arg.Key, arg.Value, kv.data[arg.Key])
+				} else {
+					kv.data[arg.Key] += arg.Value
+					// DPrintf("[Server Append] gid %d server %d config %d client %d seq %d index %d shard %d key %s value %s result %s", kv.gid, kv.me, kv.config.Num, arg.ClientId, arg.RequestSeq, i, shard, arg.Key, arg.Value, kv.data[arg.Key])
+				}
+				kv.cache[arg.ClientId] = arg.RequestSeq
+			}
+		}
+		notifyArg.ClientId, notifyArg.RequestSeq, notifyArg.Value = arg.ClientId, arg.RequestSeq, ""
+	} else if arg, ok := op.Args.(GetArgs); ok {
+		shard := key2shard(arg.Key)
+		if arg.ConfigNum != kv.config.Num {
+			notifyArg.Err = ErrWrongGroup
+		} else if _, ok := kv.ownShards[shard]; !ok {
+			notifyArg.Err = ErrWrongGroup
+		} else {
+			notifyArg.Value, notifyArg.Err = kv.data[arg.Key], OK
+		}
+		// DPrintf("[Server Get] gid %d server %d config %d client %d seq %d index %d shard %d key %s value %s", kv.gid, kv.me, kv.config.Num, arg.ClientId, arg.RequestSeq, i, shard, arg.Key, kv.data[arg.Key])
+		notifyArg.ClientId, notifyArg.RequestSeq = arg.ClientId, arg.RequestSeq
+	} else if newConfig, ok := op.Args.(shardmaster.Config); ok {
+		kv.applyNewConf(newConfig.Copy())
+		notifyArg.ClientId, notifyArg.RequestSeq = -2, 1
+	} else if args, ok := op.Args.([]ShardMigrationArgs); ok {
+		for _, arg := range args {
+			if arg.ConfigNum == kv.config.Num {
+				delete(kv.waitingShards, arg.Shard)
+				if _, ok := kv.ownShards[arg.Shard]; !ok { // add new shard only if not already added
+					kv.ownShards[arg.Shard] = struct{}{}
+					for k, v := range arg.Data {
+						kv.data[k] = v
+					}
+					for k, v := range arg.Cache {
+						if v > kv.cache[k] {
+							kv.cache[k] = v
+						}
+					}
+					DPrintf("[Apply NewShard] gid %d server %d config %d ownShards %v apply arg %#v", kv.gid, kv.me, kv.config.Num, kv.ownShards, arg)
+				}
+			}
+		}
+		notifyArg.ClientId, notifyArg.RequestSeq = -1, 1
+	}
+	go kv.px.Done(op.PaxosSeq)
+	kv.notifyIfPresent(i, notifyArg)
+	kv.mu.Unlock()
+}
+
+// apply new configuration
+func (kv *ShardKV) applyNewConf(newConfig shardmaster.Config) {
+	if newConfig.Num <= kv.config.Num {
+		return
+	}
+	oldConfig, oldShards := kv.config, kv.ownShards
+	kv.ownShards, kv.config = make(IntSet), newConfig.Copy()
+	for shard, newGID := range newConfig.Shards {
+		if newGID == kv.gid {
+			if _, ok := oldShards[shard]; ok || oldConfig.Num == 0 {
+				kv.ownShards[shard] = struct{}{}
+				delete(oldShards, shard)
+			} else {
+				kv.waitingShards[shard] = struct{}{}
+			}
+		}
+	}
+	for shard := range oldShards {
+		args := ShardMigrationArgs{kv.gid, kv.me, newConfig.Num, shard, make(map[string]string), make(map[int64]int)}
+		for k, v := range kv.data {
+			if key2shard(k) == shard {
+				args.Data[k] = v
+				delete(kv.data, k)
+			}
+		}
+		for k, v := range kv.cache {
+			args.Cache[k] = v
+		}
+		go kv.pushShard(shard, newConfig, args)
+	}
+}
+
+func (kv *ShardKV) pushShard(shard int, config shardmaster.Config, args ShardMigrationArgs) {
+	//	DPrintf("[Push Shard %d] gid %d server %d config %d", shard, kv.gid, kv.me, config.Num)
+	//defer DPrintf("[Push Success Shard %d] gid %d server %d config %d", shard, kv.gid, kv.me, config.Num)
+	gid := config.Shards[shard]
+	servers := config.Groups[gid]
+	pushCount, majority := 0, len(servers)/2+1 // push to a majority of server
+	pushServerSet := make(map[string]struct{})
+	for {
+		if pushCount >= majority {
+			return
+		}
+		for _, server := range servers {
+			if _, ok := pushServerSet[server]; ok {
+				continue
+			}
+			var reply ShardMigrationReply
+			if call(server, "ShardKV.ShardMigration", &args, &reply) {
+				pushServerSet[server] = struct{}{}
+				pushCount += 1
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) notifyIfPresent(seq int, arg notifyArgs) {
+	if ch, ok := kv.notifyChs[seq]; ok {
+		ch <- arg
+		delete(kv.notifyChs, seq)
+	}
+}
+
+func (kv *ShardKV) run() {
+	go kv.poll()
+	go kv.submit()
+	go kv.tick()
+	for !kv.isdead() {
+		op := <-kv.applyCh
+		kv.apply(op)
+	}
 }
 
 // tell the server to shut itself down.
@@ -98,23 +360,28 @@ func (kv *ShardKV) isunreliable() bool {
 //   in this replica group.
 // Me is the index of this server in servers[].
 //
-func StartServer(gid int64, shardmasters []string,
-	servers []string, me int) *ShardKV {
-	gob.Register(Op{})
-
+func StartServer(gid int64, shardmasters []string, servers []string, me int) *ShardKV {
 	kv := new(ShardKV)
 	kv.me = me
 	kv.gid = gid
 	kv.sm = shardmaster.MakeClerk(shardmasters)
+	kv.config = shardmaster.Config{}
 
-	// Your initialization code here.
-	// Don't call Join().
+	kv.ownShards = make(IntSet)
+	kv.receivingShards = make(map[int]map[int]ShardMigrationArgs)
+	kv.waitingShards = make(IntSet)
+
+	kv.requestSeq = 0
+	kv.pollSeq = 0
+	kv.data = make(map[string]string)
+	kv.cache = make(map[int64]int)
+	kv.notifyChs = make(map[int]chan notifyArgs)
+	kv.applyCh = make(chan Op, 100) // prevent sending into channel blocked
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
 
 	kv.px = paxos.Make(servers, me, rpcs)
-
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])
@@ -155,12 +422,6 @@ func StartServer(gid int64, shardmasters []string,
 		}
 	}()
 
-	go func() {
-		for kv.isdead() == false {
-			kv.tick()
-			time.Sleep(250 * time.Millisecond)
-		}
-	}()
-
+	go kv.run()
 	return kv
 }

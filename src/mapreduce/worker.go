@@ -6,10 +6,12 @@ import "log"
 import "net/rpc"
 import "net"
 import "container/list"
+import "sync"
 
 // Worker is a server waiting for DoJob or Shutdown RPCs
 
 type Worker struct {
+	mu     sync.Mutex
 	name   string
 	Reduce func(string, *list.List) string
 	Map    func(string) *list.List
@@ -20,7 +22,7 @@ type Worker struct {
 
 // The master sent us a job
 func (wk *Worker) DoJob(arg *DoJobArgs, res *DoJobReply) error {
-	fmt.Printf("Dojob %s job %d file %s operation %v N %d\n",
+	DPrintf("Dojob %s job %d file %s operation %v N %d\n",
 		wk.name, arg.JobNumber, arg.File, arg.Operation,
 		arg.NumOtherPhase)
 	switch arg.Operation {
@@ -37,6 +39,8 @@ func (wk *Worker) DoJob(arg *DoJobArgs, res *DoJobReply) error {
 // have processed.
 func (wk *Worker) Shutdown(args *ShutdownArgs, res *ShutdownReply) error {
 	DPrintf("Shutdown %s\n", wk.name)
+	wk.mu.Lock()
+	defer wk.mu.Unlock()
 	res.Njobs = wk.nJobs
 	res.OK = true
 	wk.nRPC = 1 // OK, because the same thread reads nRPC
@@ -77,12 +81,21 @@ func RunWorker(MasterAddress string, me string,
 	Register(MasterAddress, me)
 
 	// DON'T MODIFY CODE BELOW
-	for wk.nRPC != 0 {
+loop:
+	for {
+		wk.mu.Lock()
+		nRPC := wk.nRPC
+		wk.mu.Unlock()
+		if nRPC == 0 {
+			break loop
+		}
 		conn, err := wk.l.Accept()
 		if err == nil {
+			wk.mu.Lock()
 			wk.nRPC -= 1
 			go rpcs.ServeConn(conn)
 			wk.nJobs += 1
+			wk.mu.Unlock()
 		} else {
 			break
 		}

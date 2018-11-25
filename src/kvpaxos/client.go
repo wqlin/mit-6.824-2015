@@ -3,12 +3,16 @@ package kvpaxos
 import "net/rpc"
 import "crypto/rand"
 import "math/big"
-
-import "fmt"
+import (
+	"time"
+	"log"
+)
 
 type Clerk struct {
-	servers []string
-	// You will have to modify this struct.
+	servers    []string
+	id         int64 // client identifier
+	seq        int
+	lastServer int
 }
 
 func nrand() int64 {
@@ -21,7 +25,9 @@ func nrand() int64 {
 func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.id = nrand()
+	ck.seq = 0
+	ck.lastServer = 0
 	return ck
 }
 
@@ -55,7 +61,7 @@ func call(srv string, rpcname string,
 		return true
 	}
 
-	fmt.Println(err)
+	log.Println(err)
 	return false
 }
 
@@ -65,7 +71,18 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
+	ck.seq++
+	arg := GetArgs{ck.id, ck.seq, key}
+	DPrintf("[Get] client %d seq %d key %s", ck.id, ck.seq, key)
+	for {
+		reply := GetReply{}
+		if call(ck.servers[ck.lastServer], "KVPaxos.Get", &arg, &reply) && reply.Err == OK {
+			DPrintf("[Get Succeed] client %d seq %d key %s value %s", ck.id, ck.seq, key, reply.Value)
+			return reply.Value
+		}
+		ck.lastServer = (ck.lastServer + 1) % len(ck.servers)
+		time.Sleep(10 * time.Millisecond)
+	}
 	return ""
 }
 
@@ -73,7 +90,26 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	ck.seq++
+	arg := PutAppendArgs{ck.id, ck.seq, key, value, op}
+	if op == "Put" {
+		DPrintf("[Put] client %d seq %d key %s value %s", ck.id, ck.seq, key, value)
+	} else {
+		DPrintf("[Append] client %d seq %d key %s value", ck.id, ck.seq, key, value)
+	}
+	for {
+		reply := PutAppendReply{}
+		if call(ck.servers[ck.lastServer], "KVPaxos.PutAppend", &arg, &reply) && reply.Err == OK {
+			if op == "Put" {
+				DPrintf("[Put Succeed] client %d seq %d key %s value %s", ck.id, ck.seq, key, value)
+			} else {
+				DPrintf("[Append Succeed] client %d seq %d key %s value %s", ck.id, ck.seq,  key, value)
+			}
+			return
+		}
+		ck.lastServer = (ck.lastServer + 1) % len(ck.servers)
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

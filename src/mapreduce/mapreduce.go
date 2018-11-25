@@ -56,14 +56,12 @@ type MapReduce struct {
 	MasterAddress   string
 	registerChannel chan string
 	DoneChannel     chan bool
-	alive           bool
+	aliveChannel    chan struct{}
 	l               net.Listener
 	stats           *list.List
 
 	// Map of registered workers that you need to keep up to date
 	Workers map[string]*WorkerInfo
-
-	// add any additional state here
 }
 
 func InitMapReduce(nmap int, nreduce int,
@@ -73,11 +71,11 @@ func InitMapReduce(nmap int, nreduce int,
 	mr.nReduce = nreduce
 	mr.file = file
 	mr.MasterAddress = master
-	mr.alive = true
 	mr.registerChannel = make(chan string)
 	mr.DoneChannel = make(chan bool)
+	mr.aliveChannel = make(chan struct{})
+	mr.Workers = make(map[string]*WorkerInfo)
 
-	// initialize any additional state here
 	return mr
 }
 
@@ -98,7 +96,6 @@ func (mr *MapReduce) Register(args *RegisterArgs, res *RegisterReply) error {
 
 func (mr *MapReduce) Shutdown(args *ShutdownArgs, res *ShutdownReply) error {
 	DPrintf("Shutdown: registration server\n")
-	mr.alive = false
 	mr.l.Close() // causes the Accept to fail
 	return nil
 }
@@ -116,16 +113,22 @@ func (mr *MapReduce) StartRegistrationServer() {
 	// now that we are listening on the master address, can fork off
 	// accepting connections to another thread.
 	go func() {
-		for mr.alive {
-			conn, err := mr.l.Accept()
-			if err == nil {
-				go func() {
-					rpcs.ServeConn(conn)
-					conn.Close()
-				}()
-			} else {
-				DPrintf("RegistrationServer: accept error", err)
-				break
+	loop:
+		for {
+			select {
+			case <-mr.aliveChannel:
+				break loop
+			default:
+				conn, err := mr.l.Accept()
+				if err == nil {
+					go func() {
+						rpcs.ServeConn(conn)
+						conn.Close()
+					}()
+				} else {
+					DPrintf("RegistrationServer: accept error", err)
+					break
+				}
 			}
 		}
 		DPrintf("RegistrationServer: done\n")
@@ -139,7 +142,7 @@ func MapName(fileName string, MapJob int) string {
 
 // Split bytes of input file into nMap splits, but split only on white space
 func (mr *MapReduce) Split(fileName string) {
-	fmt.Printf("Split %s\n", fileName)
+	DPrintf("Split %s\n", fileName)
 	infile, err := os.Open(fileName)
 	if err != nil {
 		log.Fatal("Split: ", err)
@@ -202,7 +205,7 @@ func DoMap(JobNumber int, fileName string,
 		log.Fatal("DoMap: ", err)
 	}
 	size := fi.Size()
-	fmt.Printf("DoMap: read split %s %d\n", name, size)
+	DPrintf("DoMap: read split %s %d\n", name, size)
 	b := make([]byte, size)
 	_, err = file.Read(b)
 	if err != nil {
@@ -241,7 +244,7 @@ func DoReduce(job int, fileName string, nmap int,
 	kvs := make(map[string]*list.List)
 	for i := 0; i < nmap; i++ {
 		name := ReduceName(fileName, i, job)
-		fmt.Printf("DoReduce: read %s\n", name)
+		DPrintf("DoReduce: read %s\n", name)
 		file, err := os.Open(name)
 		if err != nil {
 			log.Fatal("DoReduce: ", err)
@@ -286,7 +289,7 @@ func (mr *MapReduce) Merge() {
 	kvs := make(map[string]string)
 	for i := 0; i < mr.nReduce; i++ {
 		p := MergeName(mr.file, i)
-		fmt.Printf("Merge: read %s\n", p)
+		DPrintf("Merge: read %s\n", p)
 		file, err := os.Open(p)
 		if err != nil {
 			log.Fatal("Merge: ", err)
@@ -367,14 +370,14 @@ func (mr *MapReduce) CleanupRegistration() {
 
 // Run jobs in parallel, assuming a shared file system
 func (mr *MapReduce) Run() {
-	fmt.Printf("Run mapreduce job %s %s\n", mr.MasterAddress, mr.file)
+	DPrintf("Run mapreduce job %s %s\n", mr.MasterAddress, mr.file)
 
 	mr.Split(mr.file)
 	mr.stats = mr.RunMaster()
 	mr.Merge()
 	mr.CleanupRegistration()
 
-	fmt.Printf("%s: MapReduce done\n", mr.MasterAddress)
+	DPrintf("%s: MapReduce done\n", mr.MasterAddress)
 
 	mr.DoneChannel <- true
 }

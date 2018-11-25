@@ -1,6 +1,8 @@
 package paxos
 
 //
+// implementation reference:
+// https://ramcloud.stanford.edu/~ongaro/userstudy/paxossummary.pdf
 // Paxos library, to be included in an application.
 // Multiple applications will run, each including
 // a Paxos peer.
@@ -20,7 +22,9 @@ package paxos
 // px.Min() int -- instances before this seq have been forgotten
 //
 
-import "net"
+import (
+	"net"
+)
 import "net/rpc"
 import "log"
 
@@ -29,8 +33,25 @@ import "syscall"
 import "sync"
 import "sync/atomic"
 import "fmt"
-import "math/rand"
+import (
+	crand "crypto/rand"
+	"encoding/gob"
+	"math/big"
+	"math/rand"
+	"time"
+)
 
+func init() {
+	gob.Register(Proposal{})
+	gob.Register(LogEntry{})
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
+
+const Voter = int32(1)
+const NonVoter = int32(0)
+const ProposeRetryInterval = 1500 * time.Millisecond
+const RPCRetryInterval = 10 * time.Millisecond
+const RPCRetryTimes = 5
 
 // px.Status() return values, indicating
 // whether an agreement has been decided,
@@ -39,10 +60,33 @@ import "math/rand"
 type Fate int
 
 const (
-	Decided   Fate = iota + 1
-	Pending        // not yet decided.
-	Forgotten      // decided but forgotten.
+	Forgotten Fate = iota + 1 // decided but forgotten.
+	Pending                   // not yet decided.
+	Decided
 )
+
+func (f Fate) String() string {
+	switch f {
+	case Decided:
+		return "Decided"
+	case Pending:
+		return "Pending"
+	case Forgotten:
+		return "Forgotten"
+	}
+	return "Unknown"
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := crand.Int(crand.Reader, max)
+	x := bigx.Int64()
+	return x
+}
+
+func newRandDuration(maxDuration time.Duration) time.Duration {
+	return time.Duration(nrand())%maxDuration + 1500*time.Millisecond
+}
 
 type Paxos struct {
 	mu         sync.Mutex
@@ -51,10 +95,15 @@ type Paxos struct {
 	unreliable int32 // for testing
 	rpcCount   int32 // for testing
 	peers      []string
-	me         int // index into peers[]
+	majority   int
+	me         int   // index into peers[]
+	role       int32 // 1 as voter and 0 as non-voter. Paxos replica can only vote as voter
 
-
-	// Your data here.
+	logIndex          int   // index of next log entry, initialize as 0
+	validProposeIndex int32 // valid propose index
+	offset            int   // index less than offset has been forgotten
+	entries           []LogEntry
+	doneValues        map[int]int // server -> done values
 }
 
 //
@@ -78,7 +127,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	if err != nil {
 		err1 := err.(*net.OpError)
 		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-			fmt.Printf("paxos Dial() failed: %v\n", err1)
+			// fmt.Printf("paxos Dial() failed: %v\n", err1)
 		}
 		return false
 	}
@@ -93,6 +142,82 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+func (px *Paxos) Lock() {
+	px.mu.Lock()
+}
+
+func (px *Paxos) Unlock() {
+	px.mu.Unlock()
+}
+
+func (px *Paxos) offsetIndex(index int) int {
+	return index - px.offset
+}
+
+// generate empty entry for index idx
+func genEntryFor(idx int) LogEntry {
+	return LogEntry{
+		Index:          idx,
+		Fate:           Pending,
+		MinProposalNum: 0,
+		Proposal: Proposal{
+			ProposalNum: 0,
+			Value:       nil, // default value is nil
+		}}
+}
+
+// fill log entry gap to satisfy out-of-order agreement
+func (px *Paxos) fillGap(up int) {
+	for i := px.logIndex; i <= up; i++ {
+		px.entries = append(px.entries, genEntryFor(i))
+		px.logIndex += 1
+	}
+}
+
+func (px *Paxos) entry(idx int) LogEntry {
+	if idx >= px.logIndex {
+		px.fillGap(idx)
+	}
+	offsetIndex := px.offsetIndex(idx)
+	// DPrintf("[genEntry] %d get %d, offset %d offsetIndex %d length %d", px.me, idx, px.offset, offsetIndex, len(px.entries))
+	return px.entries[offsetIndex]
+}
+
+func (px *Paxos) setEntry(idx int, entry LogEntry) {
+	offsetIndex := px.offsetIndex(idx)
+	px.entries[offsetIndex] = entry
+}
+
+func (px *Paxos) SetRole(role int32) {
+	atomic.StoreInt32(&px.role, role)
+}
+
+func (px *Paxos) Role() int32 {
+	return atomic.LoadInt32(&px.role)
+}
+
+// log entries up to `up` is discarded
+func (px *Paxos) truncateLog(up int) {
+	start := px.offsetIndex(up)
+	if start >= 0 && start < len(px.entries) {
+		px.entries = append([]LogEntry{}, px.entries[(start + 1):]...)
+		px.offset = up + 1
+	}
+}
+
+func (px *Paxos) State() (offset int, entries []LogEntry, doneValues map[int]int) {
+	return px.offset, px.entries, px.doneValues
+}
+
+func (px *Paxos) SetState(validProposeIndex int32, offset int, entries []LogEntry, doneValues map[int]int) {
+	px.mu.Lock()
+	px.validProposeIndex = validProposeIndex
+	px.offset = offset
+	px.entries = entries
+	px.logIndex = offset + len(entries)
+	px.doneValues = doneValues
+	px.mu.Unlock()
+}
 
 //
 // the application wants paxos to start agreement on
@@ -100,87 +225,239 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // Start() returns right away; the application will
 // call Status() to find out if/when agreement
 // is reached.
+// if Start() is called with a sequence number less
+// than Min, the Start() call should be ignored
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	// Your code here.
+	px.mu.Lock()
+	if seq < px.offset {
+		px.mu.Unlock()
+		return
+	}
+	entry := px.entry(seq)
+	if entry.Fate != Decided {
+		go px.doPropose(seq, v)
+	}
+	px.mu.Unlock()
 }
 
-//
 // the application on this machine is done with
 // all instances <= seq.
-//
-// see the comments for Min() for more explanation.
-//
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	px.setDoneFor(px.me, seq)
+	px.broadcastDone()
 }
 
-//
-// the application wants to know the
-// highest instance sequence known to
-// this peer.
-//
+func (px *Paxos) getDoneFor(server int) int {
+	px.mu.Lock()
+	done := px.doneValues[server]
+	px.mu.Unlock()
+	return done
+}
+
+func (px *Paxos) setDoneFor(server int, done int) {
+	px.mu.Lock()
+	if done > px.doneValues[server] {
+		px.doneValues[server] = done
+	}
+	up := px.getMin() - 1
+	if up > px.offset {
+		px.truncateLog(up)
+	}
+	px.mu.Unlock()
+}
+
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	px.mu.Lock()
+	max := px.logIndex - 1
+	px.mu.Unlock()
+	return max
 }
 
-//
-// Min() should return one more than the minimum among z_i,
-// where z_i is the highest number ever passed
-// to Done() on peer i. A peers z_i is -1 if it has
-// never called Done().
-//
-// Paxos is required to have forgotten all information
-// about any instances it knows that are < Min().
-// The point is to free up memory in long-running
-// Paxos-based servers.
-//
-// Paxos peers need to exchange their highest Done()
-// arguments in order to implement Min(). These
-// exchanges can be piggybacked on ordinary Paxos
-// agreement protocol messages, so it is OK if one
-// peers Min does not reflect another Peers Done()
-// until after the next instance is agreed to.
-//
-// The fact that Min() is defined as a minimum over
-// *all* Paxos peers means that Min() cannot increase until
-// all peers have been heard from. So if a peer is dead
-// or unreachable, other peers Min()s will not increase
-// even if all reachable peers call Done. The reason for
-// this is that when the unreachable peer comes back to
-// life, it will need to catch up on instances that it
-// missed -- the other peers therefor cannot forget these
-// instances.
-//
 func (px *Paxos) Min() int {
-	// You code here.
-	return 0
+	px.mu.Lock()
+	min := px.getMin()
+	px.mu.Unlock()
+	return min
 }
 
-//
-// the application wants to know whether this
-// peer thinks an instance has been decided,
-// and if so what the agreed value is. Status()
-// should just inspect the local peer state;
-// it should not contact other Paxos peers.
-//
+func (px *Paxos) getMin() int {
+	min := (1 << 31) - 1
+	for _, value := range px.doneValues {
+		if value < min {
+			min = value
+		}
+	}
+	return min + 1
+}
+
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	// Your code here.
-	return Pending, nil
+	px.mu.Lock()
+	if seq < px.offset {
+		px.mu.Unlock()
+		return Forgotten, nil
+	} else if seq >= px.logIndex {
+		px.mu.Unlock()
+		return Pending, nil
+	}
+	entry := px.entry(seq)
+	fate, value := entry.Fate, entry.Proposal.Value
+	px.mu.Unlock()
+	return fate, value
 }
 
-
-
-//
-// tell the peer to shut itself down.
-// for testing.
-// please do not change these two functions.
-//
 func (px *Paxos) Kill() {
 	atomic.StoreInt32(&px.dead, 1)
 	if px.l != nil {
 		px.l.Close()
+	}
+}
+
+// drive paxos instance to reach agreement on entry
+func (px *Paxos) doPropose(idx int, v interface{}) {
+	var proposeRetryInterval time.Duration
+loop:
+	if px.isdead() || px.Role() != Voter || int(atomic.LoadInt32(&px.validProposeIndex)) > idx {
+		return
+	}
+	proposeRetryInterval = newRandDuration(ProposeRetryInterval)
+	proposalNum, proposalValue := time.Now().UnixNano()+int64(px.me), v
+	// DPrintf("[%d doPropose idx %d Prepare Phase] proposalNum %d proposalValue %+v", px.me, idx, proposalNum, proposalValue)
+	prepareNotifyCh := make(chan PrepareReply, len(px.peers))
+	prepareArgs := &PrepareArgs{Server: px.me, Index: idx, ProposalNumber: proposalNum}
+	for i := range px.peers {
+		go px.sendPrepareMsg(prepareArgs, i, prepareNotifyCh)
+	}
+	highestProposalNum := int64(0) // highest proposal number received from other server
+	prepareCnt, prepareReplyCnt := 0, 0
+	for prepareReplyCnt < len(px.peers) {
+		reply := <-prepareNotifyCh
+		DPrintf("[Fuck Reply] server %d proposalNum %d reply %+v", px.me, proposalNum, reply)
+		prepareReplyCnt ++
+		if reply.Err == ErrForgotten {
+			px.Done(idx)
+			return
+		} else if reply.Err == OK {
+			replyEntry := reply.Entry
+			DPrintf("[Fuck] server %d proposalNum %d replyEntry %+v", px.me, proposalNum, replyEntry)
+			if replyEntry.MinProposalNum > proposalNum {
+				// other server has promise to accept higher proposal
+				// abort this proposal and retry
+				time.Sleep(proposeRetryInterval)
+				goto loop
+			}
+			if replyEntry.Proposal.ProposalNum > highestProposalNum {
+				highestProposalNum = replyEntry.Proposal.ProposalNum
+				proposalValue = replyEntry.Proposal.Value
+			}
+			prepareCnt += 1
+		}
+	}
+	if prepareCnt < px.majority { // didn't receive response from a majority of server
+		DPrintf("[%d doPropose idx %d proposalNum %d Prepare Phase Retry] didn't receive enough prepare count %d\n", px.me, idx, proposalNum, prepareCnt)
+		time.Sleep(proposeRetryInterval)
+		goto loop
+	}
+	DPrintf("[%d doPropose idx %d Accept Phase] prepareCnt %d proposalNum %d proposalValue %+v ", px.me, idx, prepareCnt, proposalNum, proposalValue)
+	acceptNotifyCh := make(chan AcceptReply, len(px.peers))
+	acceptArgs := &AcceptArgs{Server: px.me, Index: idx, Proposal: Proposal{proposalNum, proposalValue}}
+	for i := range px.peers {
+		go px.sendAcceptMsg(acceptArgs, i, acceptNotifyCh)
+	}
+	acceptCnt, acceptReplyCnt := 0, 0
+	for acceptReplyCnt < len(px.peers) {
+		reply := <-acceptNotifyCh
+		acceptReplyCnt ++
+		if reply.Err == ErrForgotten {
+			px.Done(idx)
+			return
+		} else if reply.Err == OK {
+			acceptorProposalNum := reply.Entry.MinProposalNum
+			if acceptorProposalNum > proposalNum {
+				DPrintf("[%d doPropose idx %d Accept Phase] come across higher acceptorProposalNum %d proposalNum %d", px.me, idx, acceptorProposalNum, proposalNum)
+				time.Sleep(proposeRetryInterval)
+				goto loop
+			} else {
+				acceptCnt += 1
+			}
+		}
+	}
+	// DPrintf("[%d doPropose idx %d Decided Phase] acceptCnt %d proposalNum %d proposalValue %+v", px.me, idx, acceptCnt, proposalNum, proposalValue)
+	if acceptCnt < px.majority {
+		time.Sleep(proposeRetryInterval)
+		goto loop
+	}
+	decidedArgs := &DecidedArgs{Server: px.me, Index: idx, DecidedProposal: Proposal{proposalNum, proposalValue}}
+	for i := range px.peers {
+		if i != px.me {
+			go func(server int) {
+				for px.isdead() == false {
+					reply := DecidedReply{}
+					if call(px.peers[server], "Paxos.Decided", &decidedArgs, &reply) {
+						// DPrintf("[%d doPropose idx %d Decided Done] server %d reply %d", px.me, idx, server, reply.Done)
+						return
+					}
+					time.Sleep(RPCRetryInterval)
+				}
+			}(i)
+		} else {
+			go px.handleDecidedMsg(decidedArgs)
+		}
+	}
+}
+
+func (px *Paxos) sendPrepareMsg(args *PrepareArgs, server int, ch chan PrepareReply) {
+	for i := 0; i < RPCRetryTimes; i++ {
+		reply := PrepareReply{}
+		if call(px.peers[server], "Paxos.Prepare", args, &reply) {
+			ch <- reply
+			return
+		}
+	}
+	ch <- PrepareReply{Server: server, Err: ErrRPCFail}
+}
+
+func (px *Paxos) sendAcceptMsg(args *AcceptArgs, server int, ch chan AcceptReply) {
+	for i := 0; i < RPCRetryTimes; i++ {
+		reply := AcceptReply{}
+		if call(px.peers[server], "Paxos.Accept", args, &reply) {
+			ch <- reply
+			return
+		}
+		time.Sleep(RPCRetryInterval)
+	}
+	ch <- AcceptReply{Server: server, Err: ErrRPCFail}
+}
+
+func (px *Paxos) sendDoneMsg(args *DoneBroadcastArgs, server int, ch chan DoneBroadcastReply) {
+	for i := 0; i < RPCRetryTimes; i++ {
+		reply := DoneBroadcastReply{}
+		if call(px.peers[server], "Paxos.DoneBroadcast", args, &reply) {
+			ch <- reply
+			return
+		}
+		time.Sleep(RPCRetryInterval)
+	}
+	ch <- DoneBroadcastReply{Server: server, Err: ErrRPCFail}
+}
+
+func (px *Paxos) broadcastDone() {
+	args := &DoneBroadcastArgs{Server: px.me, Done: px.getDoneFor(px.me)}
+	ch := make(chan DoneBroadcastReply, len(px.peers))
+	for i := range px.peers {
+		if i != px.me {
+			go px.sendDoneMsg(args, i, ch)
+		}
+	}
+	cnt := 1
+	for cnt < len(px.peers) {
+		select {
+		case reply := <-ch:
+			if reply.Err == OK {
+				px.setDoneFor(reply.Server, reply.Done)
+			}
+			cnt++
+		}
 	}
 }
 
@@ -212,10 +489,17 @@ func (px *Paxos) isunreliable() bool {
 func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px := &Paxos{}
 	px.peers = peers
+	px.majority = len(px.peers)/2 + 1
 	px.me = me
-
-
-	// Your initialization code here.
+	px.role = Voter // on start, act as voter
+	px.validProposeIndex = 0
+	px.logIndex = 0
+	px.offset = 0
+	px.entries = make([]LogEntry, 0, 10)
+	px.doneValues = make(map[int]int)
+	for i := range px.peers {
+		px.doneValues[i] = -1
+	}
 
 	if rpcs != nil {
 		// caller will create socket &c
@@ -267,7 +551,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
 
 	return px
 }

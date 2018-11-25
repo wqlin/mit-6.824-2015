@@ -5,17 +5,36 @@ package shardmaster
 // Please don't change this file.
 //
 
-import "net/rpc"
-import "time"
-import "fmt"
+import (
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	"net/rpc"
+	"sync"
+	"time"
+)
+
+const RPCRetryInterval = 100 * time.Millisecond
 
 type Clerk struct {
-	servers []string // shardmaster replicas
+	servers  []string // shardmaster replicas
+	mu       sync.Mutex
+	clientId int64
+	seq      int
+}
+
+func nrand() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	return x
 }
 
 func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.clientId = nrand()
+	ck.seq = 0
 	return ck
 }
 
@@ -53,68 +72,74 @@ func call(srv string, rpcname string,
 	return false
 }
 
+func (ck *Clerk) getNextSeq() int {
+	ck.mu.Lock()
+	ck.seq ++
+	seq := ck.seq
+	ck.mu.Unlock()
+	return seq
+}
+
 func (ck *Clerk) Query(num int) Config {
+	args := QueryArgs{ck.clientId, ck.getNextSeq(), num}
+	//DPrintf("[Query] client %d seq %d num %d", ck.clientId, args.RequestSeq, num)
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
-			args := &QueryArgs{}
-			args.Num = num
-			var reply QueryReply
-			ok := call(srv, "ShardMaster.Query", args, &reply)
-			if ok {
+			reply := QueryReply{}
+			ok := call(srv, "ShardMaster.Query", &args, &reply)
+			if ok && reply.Err == OK {
+				//DPrintf("[Query Succeed] client %d seq %d num %d config %v", ck.clientId, args.RequestSeq, num, reply.Config)
 				return reply.Config
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(RPCRetryInterval)
 	}
 }
 
 func (ck *Clerk) Join(gid int64, servers []string) {
+	args := JoinArgs{ck.clientId, ck.getNextSeq(), gid, servers}
+	DPrintf("[Join] client %d seq %d gid %d servers %v", ck.clientId, args.RequestSeq, gid, servers)
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
-			args := &JoinArgs{}
-			args.GID = gid
-			args.Servers = servers
-			var reply JoinReply
-			ok := call(srv, "ShardMaster.Join", args, &reply)
-			if ok {
+			reply := JoinReply{}
+			ok := call(srv, "ShardMaster.Join", &args, &reply)
+			if ok && reply.Err == OK {
+				DPrintf("[Join Succeed] client %d seq %d gid %d servers %v", ck.clientId, args.RequestSeq, gid, servers)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(RPCRetryInterval)
 	}
 }
 
 func (ck *Clerk) Leave(gid int64) {
+	args := LeaveArgs{ck.clientId, ck.getNextSeq(), gid}
+	DPrintf("[Leave] client %d seq %d gid %d", ck.clientId, args.RequestSeq, gid)
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
-			args := &LeaveArgs{}
-			args.GID = gid
-			var reply LeaveReply
-			ok := call(srv, "ShardMaster.Leave", args, &reply)
-			if ok {
+			reply := LeaveReply{}
+			ok := call(srv, "ShardMaster.Leave", &args, &reply)
+			if ok && reply.Err == OK {
+				DPrintf("[Leave Succeed] client %d seq %d gid %d", ck.clientId, args.RequestSeq, gid)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(RPCRetryInterval)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int64) {
+	args := MoveArgs{ck.clientId, ck.getNextSeq(), shard, gid}
+	DPrintf("[Move] client %d seq %d gid %d shard %d", ck.clientId, args.RequestSeq, gid, shard)
 	for {
-		// try each known server.
 		for _, srv := range ck.servers {
-			args := &MoveArgs{}
-			args.Shard = shard
-			args.GID = gid
-			var reply MoveReply
-			ok := call(srv, "ShardMaster.Move", args, &reply)
-			if ok {
+			reply := MoveReply{}
+			ok := call(srv, "ShardMaster.Move", &args, &reply)
+			if ok && reply.Err == OK {
+				DPrintf("[Move Succeed] client %d seq %d gid %d shard %d", ck.clientId, args.RequestSeq, gid, shard)
 				return
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(RPCRetryInterval)
 	}
 }

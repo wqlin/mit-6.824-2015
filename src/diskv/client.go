@@ -7,12 +7,14 @@ import "sync"
 import "fmt"
 import "crypto/rand"
 import "math/big"
+const QueryMaxSleepDuration = 100 * time.Millisecond
 
 type Clerk struct {
 	mu     sync.Mutex // one RPC at a time
 	sm     *shardmaster.Clerk
 	config shardmaster.Config
-	// You'll have to modify Clerk.
+	id     int64
+	seq    int
 }
 
 func nrand() int64 {
@@ -25,7 +27,9 @@ func nrand() int64 {
 func MakeClerk(shardmasters []string) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(shardmasters)
-	// You'll have to modify MakeClerk.
+	ck.id = nrand()
+	ck.seq = 0
+	ck.config = ck.sm.Query(-1)
 	return ck
 }
 
@@ -78,43 +82,36 @@ func key2shard(key string) int {
 }
 
 //
-// fetch the current value for a key.
+// fetch the stateFile value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
-
-	// You'll have to modify Get().
-
+	ck.seq ++
+	args := GetArgs{-1, ck.id, ck.seq, key}
+	// DPrintf("[Get] client %d seq %d key %s shard %d", ck.id, ck.seq, key, key2shard(key))
 	for {
 		shard := key2shard(key)
-
 		gid := ck.config.Shards[shard]
-
 		servers, ok := ck.config.Groups[gid]
-
-		if ok {
-			// try each server in the shard's replication group.
-			for _, srv := range servers {
-				args := &GetArgs{}
-				args.Key = key
+		if ok { // try each server in the shard's replication group.
+			args.ConfigNum = ck.config.Num
+			for i, srv := range servers {
 				var reply GetReply
-				ok := call(srv, "DisKV.Get", args, &reply)
+				ok := call(srv, "DisKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					 DPrintf("[Get Succeed] client %d seq %d gid %d server %d key %s value %s", ck.id, ck.seq, gid, i, key, reply.Value)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
+				time.Sleep(QueryMaxSleepDuration)
 			}
 		}
-
-		time.Sleep(100 * time.Millisecond)
-
-		// ask master for a new configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sm.Query(ck.config.Num + 1)
 	}
 }
 
@@ -122,38 +119,37 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
-
-	// You'll have to modify PutAppend().
-
+	ck.seq ++
+	args := PutAppendArgs{-1, ck.id, ck.seq, key, value, op}
+	//if op == "Put" {
+	//	DPrintf("[Put] client %d seq %d key %s value %s shard %d", ck.id, ck.seq, key, value, key2shard(key))
+	//} else {
+	//	DPrintf("[Append] client %d seq %d key %s value %s shard %d", ck.id, ck.seq, key, value, key2shard(key))
+	//}
 	for {
 		shard := key2shard(key)
-
 		gid := ck.config.Shards[shard]
-
 		servers, ok := ck.config.Groups[gid]
-
-		if ok {
-			// try each server in the shard's replication group.
-			for _, srv := range servers {
-				args := &PutAppendArgs{}
-				args.Key = key
-				args.Value = value
-				args.Op = op
+		if ok { // try each server in the shard's replication group.
+			args.ConfigNum = ck.config.Num
+			for i, srv := range servers {
 				var reply PutAppendReply
-				ok := call(srv, "DisKV.PutAppend", args, &reply)
+				ok := call(srv, "DisKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					if op == "Put" {
+						DPrintf("[Put Succeed] client %d seq %d gid %d server %d key %s value %s", ck.id, ck.seq, gid, i, key, value)
+					} else {
+						DPrintf("[Append Succeed] client %d seq %d gid %d server %d key %s value %s", ck.id, ck.seq, gid, i, key, value)
+					}
 					return
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
+				time.Sleep(QueryMaxSleepDuration)
 			}
 		}
-
-		time.Sleep(100 * time.Millisecond)
-
-		// ask master for a new configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sm.Query(ck.config.Num + 1)
 	}
 }
 

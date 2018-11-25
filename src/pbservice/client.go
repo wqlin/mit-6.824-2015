@@ -3,14 +3,18 @@ package pbservice
 import "viewservice"
 import "net/rpc"
 import "fmt"
-
+import "time"
 import "crypto/rand"
-import "math/big"
-
+import (
+	"math/big"
+	"strconv"
+)
 
 type Clerk struct {
-	vs *viewservice.Clerk
-	// Your declarations here
+	vs      *viewservice.Clerk
+	current viewservice.View // current view
+	id      int64            // client identifier
+	seq     int64            // client request  sequence numbe
 }
 
 // this may come in handy.
@@ -24,11 +28,11 @@ func nrand() int64 {
 func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
-	// Your ck.* initializations here
-
+	ck.current, _ = ck.vs.Get()
+	ck.id = nrand()
+	ck.seq = 0
 	return ck
 }
-
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -72,18 +76,43 @@ func call(srv string, rpcname string,
 // says the key doesn't exist (has never been Put().
 //
 func (ck *Clerk) Get(key string) string {
+	args := GetArgs{Key: key}
+	for {
+		reply := GetReply{}
+		args.Viewnum = ck.current.Viewnum
+		if ck.current.Primary != "" && call(ck.current.Primary, "PBServer.Get", &args, &reply) {
+			// DPrintf("[Client Get] args %#v reply %#v\n", args, reply)
+			if reply.Err == OK {
+				return reply.Value
+			}
+		}
+		time.Sleep(viewservice.PingInterval)
+		ck.current, _ = ck.vs.Get()
+	}
+}
 
-	// Your code here.
-
-	return "???"
+func (ck *Clerk) genId() string {
+	return strconv.FormatInt(ck.id, 36) + strconv.FormatInt(ck.seq, 36)
 }
 
 //
 // send a Put or Append RPC
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-
-	// Your code here.
+	args := PutAppendArgs{RequestId: "", ExpireRequestId: ck.genId(), Key: key, Value: value, Op: op}
+	ck.seq += 1
+	args.RequestId = ck.genId()
+	for {
+		reply := PutAppendReply{}
+		args.Viewnum = ck.current.Viewnum
+		if ck.current.Primary != "" && call(ck.current.Primary, "PBServer.PutAppend", &args, &reply) {
+			if reply.Err == OK {
+				return
+			}
+		}
+		time.Sleep(viewservice.PingInterval)
+		ck.current, _ = ck.vs.Get()
+	}
 }
 
 //

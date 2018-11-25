@@ -1,2 +1,6 @@
 api.key
 *-handin.tar.gz
+.idea/
+*.py
+error*
+pkg/
